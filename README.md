@@ -99,6 +99,7 @@ https://github.com/user-attachments/assets/0d437a41-0b0d-48ed-8c9b-02763d5e48ea
 - [Output Formats](#output-formats)
 - [Common Issues](#common-issues)
 - [Special Thanks](#special-thanks)
+- [API Documentation](#api-documentation)
 - [Table of Contents](#table-of-contents)
 
 
@@ -509,3 +510,128 @@ For an XTTS custom model a ref audio clip of the voice reference is mandatory:
 - **Calibre**: [Calibre Website](https://calibre-ebook.com)
 - **FFmpeg**: [FFmpeg Website](https://ffmpeg.org)
 - [@shakenbake15 for better chapter saving method](https://github.com/DrewThomasson/ebook2audiobook/issues/8) 
+
+## API Documentation
+
+The application provides a FastAPI backend for converting ebooks to audiobooks.
+
+### Authentication
+
+Authentication is handled via JWT (JSON Web Tokens). To access protected endpoints, you must first obtain an access token.
+
+**POST `/auth/token`**
+
+*   **Request:** Form data (`application/x-www-form-urlencoded`)
+    *   `username`: Your username.
+    *   `password`: Your password.
+*   **Response (200 OK):**
+    ```json
+    {
+        "access_token": "your_jwt_token_here",
+        "token_type": "bearer"
+    }
+    ```
+*   **Response (401 Unauthorized):** If credentials are invalid.
+
+A test user is available with `username: testuser@example.com` and `password: testpassword`.
+
+### Endpoints
+
+**POST `/upload_ebook`** (Protected)
+
+*   Uploads an ebook file for conversion.
+*   **Request:** Multipart form data.
+    *   `file`: The ebook file to upload.
+*   **Headers:**
+    *   `Authorization: Bearer <your_access_token>`
+*   **Response (200 OK):**
+    ```json
+    {
+        "session_id": "unique_session_id_for_this_conversion",
+        "book_id": "unique_id_for_this_book_content",
+        "filename": "original_uploaded_filename.epub",
+        "message": "Ebook uploaded successfully. Processing started."
+    }
+    ```
+*   **Response (401 Unauthorized):** If token is missing or invalid.
+*   **Response (500 Internal Server Error):** If file processing fails.
+*   **Note:** This endpoint initiates a background task for the conversion.
+
+**GET `/audiobook_status/{session_id}/{book_id}`** (Protected)
+
+*   Checks the status of an ongoing or completed audiobook conversion.
+*   **Path Parameters:**
+    *   `session_id`: The session ID returned by `/upload_ebook`.
+    *   `book_id`: The book ID returned by `/upload_ebook`.
+*   **Headers:**
+    *   `Authorization: Bearer <your_access_token>`
+*   **Response (200 OK):**
+    ```json
+    {
+        "session_id": "unique_session_id",
+        "book_id": "unique_book_id",
+        "status": "PENDING | PROCESSING | COMPLETED | ERROR",
+        "message": "Optional message, e.g., error details."
+    }
+    ```
+*   **Response (401 Unauthorized):** If token is missing or invalid.
+*   **Response (404 Not Found):** If the session/book ID is not found or does not belong to the user.
+
+**GET `/download_audiobook/{session_id}/{book_id}`** (Protected)
+
+*   Downloads the converted audiobook file.
+*   **Path Parameters:**
+    *   `session_id`: The session ID.
+    *   `book_id`: The book ID.
+*   **Headers:**
+    *   `Authorization: Bearer <your_access_token>`
+*   **Response (200 OK):**
+    *   The audio file (e.g., `audio/mpeg` for MP3).
+*   **Response (400 Bad Request):** If the audiobook is not yet completed.
+*   **Response (401 Unauthorized):** If token is missing or invalid.
+*   **Response (404 Not Found):** If the audiobook file is not found or does not belong to the user.
+
+**GET `/users/me`** (Protected)
+
+*   Retrieves the details of the currently authenticated user.
+*   **Headers:**
+    *   `Authorization: Bearer <your_access_token>`
+*   **Response (200 OK):**
+    ```json
+    {
+        "username": "testuser@example.com",
+        "email": "testuser@example.com",
+        "disabled": false
+    }
+    ```
+*   **Response (401 Unauthorized):** If token is missing or invalid.
+
+**GET `/audiobooks`** (Protected)
+
+*   Lists all audiobooks initiated by the currently authenticated user.
+*   **Headers:**
+    *   `Authorization: Bearer <your_access_token>`
+*   **Response (200 OK):**
+    ```json
+    {
+        "username": "current_user_username",
+        "audiobooks": [
+            {
+                "book_id": "some_book_id_1",
+                "title": "original_filename1.epub",
+                "status": "COMPLETED"
+            },
+            {
+                "book_id": "some_book_id_2",
+                "title": "original_filename2.txt",
+                "status": "PROCESSING"
+            }
+        ]
+    }
+    ```
+*   **Response (401 Unauthorized):** If token is missing or invalid.
+
+### Notes:
+*   The `session_id` is unique per conversion job/upload.
+*   The `book_id` is a hash of the ebook file's content, making it unique to the content itself.
+*   Error responses will typically include a `detail` field with more information.
