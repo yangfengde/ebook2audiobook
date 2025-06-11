@@ -7,9 +7,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-import multiprocessing # Added import
+import multiprocessing
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Depends, status as fastapi_status
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Depends, status as fastapi_status, Request # Added Request
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -20,8 +20,9 @@ try:
     jwt_available = True
 except ImportError:
     jwt_available = False
-    logger = logging.getLogger(__name__)
-    logger.warning("python-jose not found. Using mock JWT implementation. THIS IS NOT SECURE.")
+    # Define logger locally for mocks if global logger isn't set yet
+    mock_logger = logging.getLogger(__name__ + "_mock")
+    mock_logger.warning("python-jose not found. Using mock JWT implementation. THIS IS NOT SECURE.")
     class JWTError(Exception): pass
     class jwt:
         @staticmethod
@@ -38,8 +39,8 @@ try:
     passlib_available = True
 except ImportError:
     passlib_available = False
-    logger = logging.getLogger(__name__)
-    logger.warning("passlib not found. Using mock password hashing. THIS IS NOT SECURE.")
+    mock_logger = logging.getLogger(__name__ + "_mock")
+    mock_logger.warning("passlib not found. Using mock password hashing. THIS IS NOT SECURE.")
     class CryptContext:
         def __init__(self, schemes=None, deprecated=None): pass
         def verify(self, secret, hash): return secret == hash
@@ -47,10 +48,10 @@ except ImportError:
 
 # Actual imports from the project
 from lib.functions import (
-    SessionContext, # Ensured import
+    SessionContext,
     convert_ebook,
     get_sanitized,
-    prepare_dirs
+    # prepare_dirs # Not directly used by api.py after SessionContext changes in lib.functions
 )
 from lib.conf import (
     default_device,
@@ -68,8 +69,8 @@ from lib.conf import (
 )
 from lib.lang import default_language_code, language_mapping
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO) # Configure root logger
+logger = logging.getLogger(__name__) # Get logger for this module
 
 # --- Authentication Settings & Utilities ---
 SECRET_KEY = "your-secret-key-here"
@@ -150,14 +151,23 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
 app = FastAPI(version=prog_version)
 
 # --- Global Variables & Setup ---
-# context = SessionContext() # Removed global instantiation here
-context: Optional[SessionContext] = None # Define as None initially
+# context: Optional[SessionContext] = None # Will be initialized in startup_event and stored in app.state
 
+# Define base directories at module level for use in startup and endpoints
 api_base_tmp_dir = Path(tmp_dir) / "api_uploads"
 api_base_audiobooks_dir = Path(audiobooks_gui_dir) / "api_outputs"
-# These are fine to run at module level as they only define paths and ensure dirs exist
-api_base_tmp_dir.mkdir(parents=True, exist_ok=True)
-api_base_audiobooks_dir.mkdir(parents=True, exist_ok=True)
+
+@app.on_event("startup")
+async def startup_event_handler():
+    app.state.session_context = SessionContext()
+    # Ensure required directories exist
+    os.makedirs(api_base_tmp_dir, exist_ok=True)
+    os.makedirs(api_base_audiobooks_dir, exist_ok=True)
+
+    logger.info("SessionContext initialized and stored in app.state.session_context.")
+    logger.info(f"API uploads directory ensured: {api_base_tmp_dir}")
+    logger.info(f"API outputs directory ensured: {api_base_audiobooks_dir}")
+
 
 # --- Pydantic Models ---
 class UploadResponse(BaseModel):
@@ -221,6 +231,7 @@ async def read_users_me(current_user: User = Depends(get_current_active_user)):
 
 @app.post("/upload_ebook", response_model=UploadResponse)
 async def upload_ebook_endpoint(
+    request: Request, # Added Request
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user)
@@ -229,7 +240,8 @@ async def upload_ebook_endpoint(
     original_filename = file.filename if file.filename else "untitled_ebook"
     filename_noext, _ = os.path.splitext(original_filename)
 
-    if context is None: # Should have been initialized in __main__
+    s_context = request.app.state.session_context # Get context from app state
+    if s_context is None:
         raise HTTPException(status_code=500, detail="Session context not initialized")
 
     try:
@@ -259,11 +271,11 @@ async def upload_ebook_endpoint(
             "output_format": default_output_format,
             "owner_username": current_user.username
         }
-        if session_id not in context.sessions:
-            context.sessions[session_id] = {}
-        context.sessions[session_id][book_id] = session_data
+        if session_id not in s_context.sessions:
+            s_context.sessions[session_id] = {}
+        s_context.sessions[session_id][book_id] = session_data
 
-        args_for_conversion = { # Renamed for clarity
+        args_for_conversion = {
             "is_gui_process": False,
             "session": session_id,
             "script_mode": "API",
@@ -279,7 +291,7 @@ async def upload_ebook_endpoint(
             "length_penalty": default_xtts_settings.get('length_penalty', 1.0),
             "fine_tuned": default_xtts_settings.get('fine_tuned', True),
             "ebook_list": None,
-            "context_for_convert": context, # Pass the global context instance
+            "context_for_convert": s_context, # Pass the context from app.state
             "book_id_for_convert": book_id
         }
         if default_tts_engine == "XTTS":
@@ -287,7 +299,7 @@ async def upload_ebook_endpoint(
         elif default_tts_engine == "BARK":
             args_for_conversion.update(default_bark_settings)
 
-        context.sessions[session_id][book_id]["status"] = "PROCESSING"
+        s_context.sessions[session_id][book_id]["status"] = "PROCESSING"
 
         background_tasks.add_task(convert_ebook, args_for_conversion)
         logger.info(f"Conversion task for book_id {book_id} (session {session_id}) added to background by user {current_user.username}.")
@@ -309,10 +321,11 @@ async def upload_ebook_endpoint(
                 pass
 
 @app.get("/audiobook_status/{session_id}/{book_id}", response_model=StatusResponse)
-async def audiobook_status_endpoint(session_id: str, book_id: str, current_user: User = Depends(get_current_active_user)):
-    if context is None:
+async def audiobook_status_endpoint(request: Request, session_id: str, book_id: str, current_user: User = Depends(get_current_active_user)):
+    s_context = request.app.state.session_context
+    if s_context is None:
         raise HTTPException(status_code=500, detail="Session context not initialized")
-    session_book_data = context.sessions.get(session_id, {}).get(book_id)
+    session_book_data = s_context.sessions.get(session_id, {}).get(book_id)
 
     if not session_book_data or session_book_data.get("owner_username") != current_user.username:
         raise HTTPException(status_code=404, detail="Status not found or access denied for the given session_id and book_id.")
@@ -339,10 +352,11 @@ async def audiobook_status_endpoint(session_id: str, book_id: str, current_user:
 
 
 @app.get("/download_audiobook/{session_id}/{book_id}")
-async def download_audiobook_endpoint(session_id: str, book_id: str, current_user: User = Depends(get_current_active_user)):
-    if context is None:
+async def download_audiobook_endpoint(request: Request, session_id: str, book_id: str, current_user: User = Depends(get_current_active_user)):
+    s_context = request.app.state.session_context
+    if s_context is None:
         raise HTTPException(status_code=500, detail="Session context not initialized")
-    session_book_data = context.sessions.get(session_id, {}).get(book_id)
+    session_book_data = s_context.sessions.get(session_id, {}).get(book_id)
 
     if not session_book_data or session_book_data.get("owner_username") != current_user.username:
         raise HTTPException(status_code=404, detail="Audiobook not found or access denied.")
@@ -357,9 +371,6 @@ async def download_audiobook_endpoint(session_id: str, book_id: str, current_use
     else:
         audio_files = list(output_dir.glob(f"*.{output_format}"))
         if not audio_files:
-            # Re-check status with current_user to avoid error in status check if it's also protected
-            # status_check_response = await audiobook_status_endpoint(session_id, book_id, current_user)
-            # Instead of calling the endpoint, check status directly from session_book_data
             current_status_for_download = session_book_data.get("status", "UNKNOWN")
             if current_status_for_download != "COMPLETED":
                  raise HTTPException(status_code=400, detail=f"Audiobook processing not completed. Status: {current_status_for_download}")
@@ -385,11 +396,12 @@ async def download_audiobook_endpoint(session_id: str, book_id: str, current_use
         raise HTTPException(status_code=404, detail="Audiobook file does not exist.")
 
 @app.get("/audiobooks", response_model=AudiobookListResponse)
-async def list_my_audiobooks_endpoint(current_user: User = Depends(get_current_active_user)):
-    if context is None:
+async def list_my_audiobooks_endpoint(request: Request, current_user: User = Depends(get_current_active_user)):
+    s_context = request.app.state.session_context
+    if s_context is None:
         raise HTTPException(status_code=500, detail="Session context not initialized")
     user_audiobooks = []
-    for sid, books_in_session in context.sessions.items():
+    for sid, books_in_session in s_context.sessions.items():
         for bid, book_data in books_in_session.items():
             if book_data.get("owner_username") == current_user.username:
                 user_audiobooks.append(AudiobookListItem(
@@ -404,18 +416,16 @@ async def list_my_audiobooks_endpoint(current_user: User = Depends(get_current_a
 if __name__ == "__main__":
     import uvicorn
 
-    multiprocessing.freeze_support() # Added for multiprocessing safety
+    multiprocessing.freeze_support()
 
-    global context # Declare context as global to modify the module-level variable
-    context = SessionContext() # Instantiate SessionContext here
+    # Global context is no longer initialized here; it's handled by the startup event.
+    # Ensure logger used in startup event is configured before uvicorn.run if not already.
+    # The main logger is configured at the module level, so it should be available.
 
     logger.info(f"Starting Uvicorn server for API v{prog_version}...")
-    logger.info(f"Using mock JWT: {jwt_available}, Using mock Passlib: {passlib_available}")
-    logger.info(f"Temporary files will be stored under: {api_base_tmp_dir}")
-    logger.info(f"Audiobook outputs will be stored under: {api_base_audiobooks_dir}")
-
-    # Directories are already created at module level, but ensuring again doesn't hurt.
-    api_base_tmp_dir.mkdir(parents=True, exist_ok=True)
-    api_base_audiobooks_dir.mkdir(parents=True, exist_ok=True)
+    # The following logs are now effectively covered by the startup event's logging
+    # logger.info(f"Using mock JWT: {jwt_available}, Using mock Passlib: {passlib_available}")
+    # logger.info(f"Temporary files will be stored under: {api_base_tmp_dir}")
+    # logger.info(f"Audiobook outputs will be stored under: {api_base_audiobooks_dir}")
 
     uvicorn.run(app, host="0.0.0.0", port=8008)
