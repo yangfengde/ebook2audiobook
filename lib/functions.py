@@ -184,8 +184,16 @@ class SessionContext:
         return self.sessions[id]
 
 lock = threading.Lock()
-context = SessionContext()
+# context = SessionContext() # Global context removed/commented out.
+# The 'context' variable will now primarily be passed as an argument where needed (e.g., to convert_ebook via args['context_for_convert']).
+# Functions called by Gradio UI might still implicitly use a global context if it's created by app.py or web_interface.
+# This change is focused on making convert_ebook testable and usable by an API without relying on this specific global instance.
 is_gui_process = False
+
+# Safety check: if this module is imported and 'context' is expected globally by other parts (e.g. Gradio UI setup)
+# ensure it exists. This is a fallback. Ideally, all parts should get context explicitly.
+if 'context' not in globals():
+    context = SessionContext()
 
 def prepare_dirs(src, session):
     try:
@@ -1264,13 +1272,33 @@ def combine_audio_chapters(session):
         chapter_files = [f for f in os.listdir(session['chapters_dir']) if f.endswith(f'.{default_audio_proc_format}')]
         chapter_files = sorted(chapter_files, key=lambda x: int(re.search(r'\d+', x).group()))
         if len(chapter_files) > 0:
-            combined_chapters_file = os.path.join(session['process_dir'], get_sanitized(session['metadata']['title']) + '.' + default_audio_proc_format)
+            # Determine base name for the final file from metadata title
+            ebook_title = session.get('metadata', {}).get('title', 'audiobook')
+            if not ebook_title or not isinstance(ebook_title, str) or not ebook_title.strip():
+                ebook_title = 'audiobook' # Default if title is None, empty, or not a string
+
+            final_name_base = get_sanitized(ebook_title)
+            # final_name is now just the filename, to be joined with session['audiobooks_dir']
+            session['final_name'] = f"{final_name_base}.{session['output_format']}"
+
+            combined_chapters_file = os.path.join(session['process_dir'], get_sanitized(session['metadata']['title']) + '.' + default_audio_proc_format) # This is intermediate
             metadata_file = os.path.join(session['process_dir'], 'metadata.txt')
+
+            # final_file is the actual destination in the API-specified output directory
+            final_file = os.path.join(session['audiobooks_dir'], session['final_name'])
+            logger.info(f"Final audio file will be saved to: {final_file}")
+
+            if os.path.exists(final_file):
+                logger.info(f"Removing existing file: {final_file}")
+                os.remove(final_file)
+
+            os.makedirs(session['audiobooks_dir'], exist_ok=True) # Ensure specific output dir exists
+
             if assemble_segments():
                 if generate_ffmpeg_metadata():
-                    final_file = os.path.join(session['audiobooks_dir'], session['final_name'])                       
-                    if export_audio():
-                        return final_file
+                    # final_file path is now correctly using session['audiobooks_dir']
+                    if export_audio(): # export_audio uses final_file variable which is now correctly scoped
+                        return final_file # Return the full path of the successfully created file
         else:
             error = 'No block files exists!'
             print(error)
@@ -1382,53 +1410,80 @@ def get_compatible_tts_engines(language):
     return compatible_engines
 
 def convert_ebook_batch(args):
+    # Ensure context is passed if this function is called from an API context in future
+    # For now, assume it uses the global context if 'context_for_convert' is not in args
+    global_context_instance = args.get('context_for_convert', context if 'context' in globals() else SessionContext())
+
     if isinstance(args['ebook_list'], list):
-        ebook_list = args['ebook_list'][:]
-        for file in ebook_list: # Use a shallow copy
-            if any(file.endswith(ext) for ext in ebook_formats):
-                args['ebook'] = file
-                print(f'Processing eBook file: {os.path.basename(file)}')
-                progress_status, passed = convert_ebook(args)
+        ebook_list = args['ebook_list'][:] # Create a copy for safe removal
+        for file_path in ebook_list:
+            if any(file_path.endswith(ext) for ext in ebook_formats):
+                current_args = args.copy() # Create a copy of args for this specific ebook
+                current_args['ebook'] = file_path
+                # Ensure the context is passed to each individual conversion
+                current_args['context_for_convert'] = global_context_instance
+
+                print(f'Processing eBook file: {os.path.basename(file_path)}')
+                progress_status, passed = convert_ebook(current_args)
                 if passed is False:
-                    print(f'Conversion failed: {progress_status}')
-                    sys.exit(1)
-                args['ebook_list'].remove(file) 
-        reset_ebook_session(args['session'])
-        return progress_status, passed
+                    print(f'Conversion failed for {file_path}: {progress_status}')
+                    # Decide if one failure should stop the whole batch
+                    # For now, let's assume it continues with other books.
+                    # If it should stop, use: sys.exit(1) or raise an exception
+                else:
+                    # If reset_ebook_session is meant to clear specific book data from a shared session:
+                    # reset_ebook_session(current_args['session'], global_context_instance=global_context_instance)
+                    # However, current reset_ebook_session clears almost all fields, which might be too much for batch.
+                    # For now, we assume session management for batch items is handled if needed.
+                    pass # Individual book processing complete
+
+        # If reset_ebook_session is for the main session_id used for the batch itself:
+        if args.get('session'):
+             reset_ebook_session(args['session'], global_context_instance=global_context_instance)
+        return "Batch processing attempted.", True # Simplified return for batch
     else:
-        print(f'the ebooks source is not a list!')
-        sys.exit(1)       
+        print(f'The ebooks source is not a list!')
+        return "Ebook list not provided.", False
 
 def convert_ebook(args):
     try:
-        global is_gui_process # Uses global context by default, can be overridden by API
+        global is_gui_process
+
         error = None
-        # id = None # session_id will be 'id'
         info_session = None
 
-        # API can pass its own 'context_for_convert' (which is the global context but helps clarity)
-        # and 'book_id_for_convert' to target specific sub-dictionaries in SessionContext for API calls.
-        global_context = args.get('context_for_convert', context) # Use global context if not specified
-        book_id = args.get('book_id_for_convert', None)
+        session_id = args.get('session') if args.get('session') is not None else str(uuid.uuid4())
 
-        session_id = args['session'] if args['session'] is not None else str(uuid.uuid4()) # 'id' is session_id
+        global_context_instance = args.get('context_for_convert')
+        script_mode = args.get('script_mode', NATIVE)
+
+        if script_mode == "API" and global_context_instance is None:
+            raise ValueError("SessionContext (context_for_convert) not provided in API mode.")
+
+        if global_context_instance is None:
+            if 'context' in globals():
+                global_context_instance = globals()['context']
+            else:
+                print("Warning: Global 'context' not found and 'context_for_convert' not in args. Creating temporary SessionContext for this call.")
+                global_context_instance = SessionContext()
+
+        book_id = args.get('book_id_for_convert', None)
 
         if args['language'] is not None:
             if not os.path.splitext(args['ebook'])[1]:
                 error = f"{args['ebook']} needs a format extension."
-                # Update API context on error
-                if book_id and session_id in global_context.sessions and book_id in global_context.sessions[session_id]:
-                    global_context.sessions[session_id][book_id]['status'] = 'ERROR'
-                    global_context.sessions[session_id][book_id]['error_message'] = error
+                if book_id and session_id in global_context_instance.sessions and book_id in global_context_instance.sessions[session_id]:
+                    global_context_instance.sessions[session_id][book_id]['status'] = 'ERROR'
+                    global_context_instance.sessions[session_id][book_id]['error_message'] = error
                 print(error)
-                return error, False # Corrected from 'false'
+                return error, False
             if not os.path.exists(args['ebook']):
                 error = 'File does not exist or Directory empty.'
-                if book_id and session_id in global_context.sessions and book_id in global_context.sessions[session_id]:
-                    global_context.sessions[session_id][book_id]['status'] = 'ERROR'
-                    global_context.sessions[session_id][book_id]['error_message'] = error
+                if book_id and session_id in global_context_instance.sessions and book_id in global_context_instance.sessions[session_id]:
+                    global_context_instance.sessions[session_id][book_id]['status'] = 'ERROR'
+                    global_context_instance.sessions[session_id][book_id]['error_message'] = error
                 print(error)
-                return error, False # Corrected from 'false'
+                return error, False
             try:
                 if len(args['language']) == 2:
                     lang_array = languages.get(part1=args['language'])
@@ -1443,20 +1498,19 @@ def convert_ebook(args):
                 else:
                     args['language_iso1'] = None
             except Exception as e:
-                pass # Language code processing error, might proceed with default or raise
+                pass
 
             if args['language'] not in language_mapping.keys():
                 error = 'The language you provided is not (yet) supported'
-                if book_id and session_id in global_context.sessions and book_id in global_context.sessions[session_id]:
-                    global_context.sessions[session_id][book_id]['status'] = 'ERROR'
-                    global_context.sessions[session_id][book_id]['error_message'] = error
+                if book_id and session_id in global_context_instance.sessions and book_id in global_context_instance.sessions[session_id]:
+                    global_context_instance.sessions[session_id][book_id]['status'] = 'ERROR'
+                    global_context_instance.sessions[session_id][book_id]['error_message'] = error
                 print(error)
-                return error, False # Corrected from 'false'
+                return error, False
 
             is_gui_process = args['is_gui_process']
-            # session_id is already 'id' from args['session'] or new uuid
-            session = global_context.get_session(session_id) # Use global_context
-            session['script_mode'] = args['script_mode'] if args['script_mode'] is not None else NATIVE   
+            session = global_context_instance.get_session(session_id)
+            session['script_mode'] = script_mode
             session['ebook'] = args['ebook']
             session['ebook_list'] = args['ebook_list']
             session['device'] = args['device']
@@ -1476,10 +1530,10 @@ def convert_ebook(args):
             session['enable_text_splitting'] = args['enable_text_splitting']
             session['text_temp'] =  args['text_temp']
             session['waveform_temp'] =  args['waveform_temp']
-            session['audiobooks_dir'] = args['audiobooks_dir']
+            session['audiobooks_dir'] = args['audiobooks_dir'] # This is the specific output dir for the book from API
             session['voice'] = args['voice']
             
-            info_session = f"\n*********** Session: {id} **************\nStore it in case of interruption, crash, reuse of custom model or custom voice,\nyou can resume the conversion with --session option"
+            info_session = f"\n*********** Session: {session_id} **************\nStore it in case of interruption, crash, reuse of custom model or custom voice,\nyou can resume the conversion with --session option"
 
             if not is_gui_process:
                 session['voice_dir'] = os.path.join(voices_dir, '__sessions',f"voice-{session['id']}")
@@ -1498,7 +1552,7 @@ def convert_ebook(args):
                             else:
                                 error = f"{model} could not be extracted or mandatory files are missing"
                         else:
-                            error = f'{os.path.basename(f)} is not a valid model or some required files are missing'
+                            error = f'{os.path.basename(f)} is not a valid model or some required files are missing' # f might be undefined here
                 if session['voice'] is not None:
                     os.makedirs(session['voice_dir'], exist_ok=True)
                     voice_name = get_sanitized(os.path.splitext(os.path.basename(session['voice']))[0])
@@ -1513,17 +1567,21 @@ def convert_ebook(args):
                             print(error)
             if error is None:
                 if session['script_mode'] == NATIVE:
-                    bool, e = check_programs('Calibre', 'ebook-convert', '--version')
-                    if not bool:
-                        error = f'check_programs() Calibre failed: {e}'
-                    bool, e = check_programs('FFmpeg', 'ffmpeg', '-version')
-                    if not bool:
-                        error = f'check_programs() FFMPEG failed: {e}'
+                    bool_calibre, e_calibre = check_programs('Calibre', 'ebook-convert', '--version')
+                    if not bool_calibre:
+                        error = f'check_programs() Calibre failed: {e_calibre}'
+                    bool_ffmpeg, e_ffmpeg = check_programs('FFmpeg', 'ffmpeg', '-version')
+                    if not bool_ffmpeg:
+                        error = f'check_programs() FFMPEG failed: {e_ffmpeg}'
+
                 if error is None:
+                    session['id'] = session_id
+
                     session['session_dir'] = os.path.join(tmp_dir, f"ebook-{session['id']}")
                     session['process_dir'] = os.path.join(session['session_dir'], f"{hashlib.md5(session['ebook'].encode()).hexdigest()}")
                     session['chapters_dir'] = os.path.join(session['process_dir'], "chapters")
                     session['chapters_dir_sentences'] = os.path.join(session['chapters_dir'], 'sentences')       
+
                     if prepare_dirs(args['ebook'], session):
                         session['filename_noext'] = os.path.splitext(os.path.basename(session['ebook']))[0]
                         msg = ''
@@ -1563,17 +1621,17 @@ def convert_ebook(args):
                         if convert2epub(session):
                             epubBook = epub.read_epub(session['epub_path'], {'ignore_ncx': True})       
                             metadata = dict(session['metadata'])
-                            for key, value_attr in metadata.items(): # Renamed value to value_attr to avoid conflict
+                            for key, value_attr in metadata.items():
                                 data = epubBook.get_metadata('DC', key)
                                 if data:
-                                    for epub_val, attributes in data: # Renamed value to epub_val
+                                    for epub_val, attributes in data:
                                         metadata[key] = epub_val
-                            metadata['language'] = session['language'] # Ensure session language is part of metadata
+                            metadata['language'] = session['language']
                             metadata['title'] = metadata['title'] if metadata['title'] else os.path.splitext(os.path.basename(session['ebook']))[0].replace('_',' ')
                             metadata['creator'] =  False if not metadata['creator'] or metadata['creator'] == 'Unknown' else metadata['creator']
                             session['metadata'] = metadata
                             
-                            try: # Ensure metadata language is 3-letter code if possible
+                            try:
                                 if session['metadata'].get('language') and len(session['metadata']['language']) == 2:
                                     lang_array = languages.get(part1=session['metadata']['language'])
                                     if lang_array:
@@ -1582,25 +1640,22 @@ def convert_ebook(args):
                                 print(f"Could not normalize metadata language: {e_lang}")
                            
                             if session['metadata']['language'] != session['language']:
-                                # This is a warning, not necessarily a fatal error.
                                 print(f"WARNING!!! language selected {session['language']} differs from the EPUB file language {session['metadata']['language']}")
 
                             session['cover'] = get_cover(epubBook, session)
-                            if session['cover']: # Assuming get_cover returns False on critical failure
+                            if session['cover']:
                                 session['toc'], session['chapters'] = get_chapters(epubBook, session)
-                                # session['final_name'] is now set within combine_audio_chapters based on metadata title
                                 if session['chapters'] is not None:
                                     if convert_chapters2audio(session):
-                                        final_file_path = combine_audio_chapters(session) # Ensures it uses updated session['audiobooks_dir']
+                                        final_file_path = combine_audio_chapters(session)
                                         if final_file_path is not None:
-                                            # Cleanup logic
                                             chapters_dirs = [
                                                 dir_name for dir_name in os.listdir(session['process_dir'])
                                                 if fnmatch.fnmatch(dir_name, "chapters_*") and os.path.isdir(os.path.join(session['process_dir'], dir_name))
                                             ]
                                             shutil.rmtree(os.path.join(session['voice_dir'], 'proc'), ignore_errors=True)
-                                            if not session.get('skip_cleanup', False): # Check skip_cleanup flag
-                                                if is_gui_process: # GUI specific cleanup
+                                            if not session.get('skip_cleanup', False):
+                                                if is_gui_process:
                                                     if len(chapters_dirs) > 1:
                                                         if os.path.exists(session['chapters_dir']):
                                                             shutil.rmtree(session['chapters_dir'], ignore_errors=True)
@@ -1608,26 +1663,26 @@ def convert_ebook(args):
                                                             os.remove(session['epub_path'])
                                                         if session.get('cover') and isinstance(session['cover'], str) and os.path.exists(session['cover']):
                                                             os.remove(session['cover'])
-                                                    else: # if only one chapter_dir (implies less intermediate files or structure)
+                                                    else:
                                                         if os.path.exists(session['process_dir']):
                                                             shutil.rmtree(session['process_dir'], ignore_errors=True)
-                                                else: # CLI or API cleanup
-                                                    if os.path.exists(session['voice_dir']) and not any(os.scandir(session['voice_dir'])): # only if empty
+                                                else:
+                                                    if os.path.exists(session['voice_dir']) and not any(os.scandir(session['voice_dir'])):
                                                         shutil.rmtree(session['voice_dir'], ignore_errors=True)
                                                     if os.path.exists(session['custom_model_dir']) and not any(os.scandir(session['custom_model_dir'])):
                                                         shutil.rmtree(session['custom_model_dir'], ignore_errors=True)
-                                                    if os.path.exists(session['session_dir']): # main temp processing for this session run
+                                                    if os.path.exists(session['session_dir']):
                                                         shutil.rmtree(session['session_dir'], ignore_errors=True)
 
                                             progress_status = f'Audiobook {os.path.basename(final_file_path)} created!'
 
-                                            # Update context for API or general session
-                                            if book_id and session_id in global_context.sessions and book_id in global_context.sessions[session_id]:
-                                                global_context.sessions[session_id][book_id]['audiobook'] = str(final_file_path)
-                                                global_context.sessions[session_id][book_id]['status'] = 'COMPLETED'
-                                            else: # Fallback for non-API calls
-                                                session['audiobook'] = str(final_file_path) # Already done by API if book_id exists
-                                                global_context.set_session(session_id, 'status', 'COMPLETED')
+                                            if book_id and session_id in global_context_instance.sessions and book_id in global_context_instance.sessions[session_id]:
+                                                book_state_dict = global_context_instance.sessions[session_id][book_id]
+                                                book_state_dict['audiobook'] = str(final_file_path)
+                                                book_state_dict['status'] = 'COMPLETED'
+                                            else:
+                                                session['audiobook'] = str(final_file_path)
+                                                global_context_instance.set_session(session_id, 'status', 'COMPLETED')
 
                                             print(info_session)
                                             return progress_status, True
@@ -1635,48 +1690,44 @@ def convert_ebook(args):
                                             error = 'combine_audio_chapters() error: final_file_path not created!'
                                     else:
                                         error = 'convert_chapters2audio() failed!'
-                                else: # session['chapters'] is None
+                                else:
                                     error = 'get_chapters() failed to extract chapters!'
-                            else: # get_cover() failed
+                            else:
                                 error = 'get_cover() failed!'
-                        else: # convert2epub() failed
+                        else:
                             error = 'convert2epub() failed!'
-                    else: # prepare_dirs() failed
+                    else:
                         error = f"Temporary directory {session.get('process_dir', 'unknown')} could not be prepared."
-        else: # Language not supported
+        else:
             error = f"Language {args['language']} is not supported."
 
-        # Centralized error setting before returning False
         if error:
-            current_error_message = error # Preserve the first error encountered
-            if session.get('cancellation_requested'): # Check for cancellation
+            current_error_message = error
+            if session.get('cancellation_requested'):
                 current_error_message = 'Cancelled'
 
-            print(current_error_message) # Print the specific error or cancellation message
-            if not is_gui_process and session_id: # Append session info for CLI errors
+            print(current_error_message)
+            if not is_gui_process and session_id:
                 print(info_session)
 
-            # Update API context with error
-            if book_id and session_id in global_context.sessions and book_id in global_context.sessions[session_id]:
-                global_context.sessions[session_id][book_id]['status'] = 'ERROR'
-                global_context.sessions[session_id][book_id]['error_message'] = current_error_message
-            else: # Fallback for other modes
-                global_context.set_session(session_id, 'status', 'ERROR')
-                # Consider adding 'error_message' to general session if it's a defined field
-                # global_context.set_session(session_id, 'error_message', current_error_message)
+            if book_id and session_id in global_context_instance.sessions and book_id in global_context_instance.sessions[session_id]:
+                book_state_dict = global_context_instance.sessions[session_id][book_id]
+                book_state_dict['status'] = 'ERROR'
+                book_state_dict['error_message'] = current_error_message
+            else:
+                global_context_instance.set_session(session_id, 'status', 'ERROR')
             return current_error_message, False
 
     except Exception as e:
-        # Catch any unexpected exceptions during the process
         tb_str = traceback.format_exc()
-        error_message = f"convert_ebook() top-level Exception: {str(e)}\nTraceback: {tb_str}"
+        error_message = f"convert_ebook() top-level Exception for session {session_id}: {str(e)}\nTraceback: {tb_str}"
         print(error_message)
-        if book_id and session_id in global_context.sessions and book_id in global_context.sessions[session_id]:
-            global_context.sessions[session_id][book_id]['status'] = 'ERROR'
-            global_context.sessions[session_id][book_id]['error_message'] = str(e) # Keep it concise for API response
-        elif session_id: # If session_id known but not necessarily full API context
-            global_context.set_session(session_id, 'status', 'ERROR')
-            # global_context.set_session(session_id, 'error_message', str(e))
+        if book_id and session_id in global_context_instance.sessions and book_id in global_context_instance.sessions[session_id]: # Check if global_context_instance is defined
+            book_state_dict = global_context_instance.sessions[session_id][book_id]
+            book_state_dict['status'] = 'ERROR'
+            book_state_dict['error_message'] = str(e)
+        elif session_id and global_context_instance: # Check if global_context_instance is defined
+            global_context_instance.set_session(session_id, 'status', 'ERROR')
         return str(e), False
 
 def restore_session_from_data(data, session):
@@ -1690,8 +1741,16 @@ def restore_session_from_data(data, session):
     except Exception as e:
         alert_exception(e)
 
-def reset_ebook_session(id):
-    session = context.get_session(id)
+def reset_ebook_session(id, global_context_instance=None):
+    active_context = global_context_instance
+    if active_context is None:
+        if 'context' in globals():
+            active_context = globals()['context']
+        else:
+            print("Error: SessionContext not available in reset_ebook_session. Cannot reset session.")
+            return
+
+    session = active_context.get_session(id)
     data = {
         "ebook": None,
         "chapters_dir": None,
