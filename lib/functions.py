@@ -50,8 +50,7 @@ from ebooklib import epub
 from glob import glob
 from iso639 import languages
 from markdown import markdown
-from multiprocessing import Manager, Event
-from multiprocessing.managers import DictProxy, ListProxy
+from multiprocessing import Event # Manager, DictProxy, ListProxy removed
 from num2words import num2words
 from pathlib import Path
 from pydub import AudioSegment
@@ -89,38 +88,19 @@ class DependencyError(Exception):
         if not is_gui_process:
             sys.exit(1)
 
-def recursive_proxy(data, manager=None):
-    if manager is None:
-        manager = Manager()
-    if isinstance(data, dict):
-        proxy_dict = manager.dict()
-        for key, value in data.items():
-            proxy_dict[key] = recursive_proxy(value, manager)
-        return proxy_dict
-    elif isinstance(data, list):
-        proxy_list = manager.list()
-        for item in data:
-            proxy_list.append(recursive_proxy(item, manager))
-        return proxy_list
-    elif isinstance(data, (str, int, float, bool, type(None))):
-        return data
-    else:
-        error = f"Unsupported data type: {type(data)}"
-        print(error)
-        return
-
 class SessionContext:
     def __init__(self):
-        self.manager = Manager()
-        self.sessions = self.manager.dict()  # Store all session-specific contexts
+        self.sessions = {} # Store all session-specific contexts
+        self.lock = threading.Lock()
         self.cancellation_events = {}  # Store multiprocessing.Event for each session
 
     def get_session(self, id):
-        if id not in self.sessions:
-            self.sessions[id] = recursive_proxy({
-                "script_mode": NATIVE,
-                "id": id,
-                "process_id": None,
+        with self.lock:
+            if id not in self.sessions:
+                self.sessions[id] = { # Removed recursive_proxy, using standard dict
+                    "script_mode": NATIVE,
+                    "id": id,
+                    "process_id": None,
                 "device": default_device,
                 "system": None,
                 "client": None,
@@ -154,7 +134,7 @@ class SessionContext:
                 "num_beams": default_xtts_settings['num_beams'],
                 "repetition_penalty": default_xtts_settings['repetition_penalty'],
                 "top_k": default_xtts_settings['top_k'],
-                "top_p": default_xtts_settings['top_k'],
+                "top_p": default_xtts_settings['top_p'], # Corrected to use 'top_p'
                 "speed": default_xtts_settings['speed'],
                 "enable_text_splitting": default_xtts_settings['enable_text_splitting'],
                 "text_temp": default_bark_settings['text_temp'],
@@ -180,10 +160,10 @@ class SessionContext:
                     "Source": None,
                     "Modified": None,
                 }
-            }, manager=self.manager)
+            } # manager=self.manager removed
         return self.sessions[id]
 
-lock = threading.Lock()
+#lock = threading.Lock() # Global lock removed, instance lock self.lock is used now.
 # context = SessionContext() # Global context removed/commented out.
 # The 'context' variable will now primarily be passed as an argument where needed (e.g., to convert_ebook via args['context_for_convert']).
 # Functions called by Gradio UI might still implicitly use a global context if it's created by app.py or web_interface.
@@ -1750,10 +1730,12 @@ def reset_ebook_session(id, global_context_instance=None):
             print("Error: SessionContext not available in reset_ebook_session. Cannot reset session.")
             return
 
-    session = active_context.get_session(id)
-    data = {
-        "ebook": None,
-        "chapters_dir": None,
+    session = active_context.get_session(id) # This call is now thread-safe due to lock in get_session
+    # Modifications to the session dictionary itself should be locked
+    with active_context.lock:
+        data = {
+            "ebook": None,
+            "chapters_dir": None,
         "chapters_dir_sentences": None,
         "epub_path": None,
         "filename_noext": None,
@@ -1781,9 +1763,9 @@ def reset_ebook_session(id, global_context_instance=None):
             "relation": None,
             "Source": None,
             "Modified": None
+            }
         }
-    }
-    restore_session_from_data(data, session)
+        restore_session_from_data(data, session) # Operates on session dict within the lock
 
 def get_all_ip_addresses():
     ip_addresses = []
