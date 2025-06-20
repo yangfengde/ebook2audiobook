@@ -8,6 +8,7 @@
 import argparse
 import asyncio
 import csv
+import jieba
 import ebooklib
 import fnmatch
 import gc
@@ -40,6 +41,9 @@ import lib.conf as conf
 import lib.lang as lang
 import lib.models as mod
 
+from soynlp.tokenizer import LTokenizer
+from pythainlp.tokenize import word_tokenize
+from sudachipy import dictionary, tokenizer
 from tqdm import tqdm
 from bs4 import BeautifulSoup
 from collections import Counter
@@ -399,7 +403,7 @@ def math2word(text, lang, lang_iso1, tts_engine):
         text = re.sub(ambiguous_pattern, replace_ambiguous, text)
     # Regex pattern for detecting numbers (handles negatives, commas, decimals, scientific notation)
     number_pattern = r'\s*(-?\d{1,3}(?:,\d{3})*(?:\.\d+(?!\s|$))?(?:[eE][-+]?\d+)?)\s*'
-    if tts_engine == VITS or tts_engine == FAIRSEQ or tts_engine == YOURTTS:
+    if tts_engine in [TACOTRON2, VITS, FAIRSEQ, YOURTTS]:
         if is_num2words_compat:
             # Pattern 2: Split big numbers into groups of 4
             text = re.sub(r'(\d{4})(?=\d{4}(?!\.\d))', r'\1 ', text)
@@ -428,19 +432,20 @@ def normalize_text(text, lang, lang_iso1, tts_engine):
     text = re.sub(r'\b(?:[a-zA-Z]\.){1,}[a-zA-Z]?\b\.?', lambda m: m.group().replace('.', '').upper(), text)
     # Replace ### and [pause] with ‡pause‡ (‡ = double dagger U+2021)
     text = re.sub(r'(###|\[pause\])', '‡pause‡', text)
+    # Replace multiple newlines ("\n\n", "\r\r", "\n\r", etc.) with a ‡pause‡ 1.4sec
+    pattern = r'(?:\r\n|\r|\n){2,}'
+    text = re.sub(pattern, '‡pause‡', text)
+    # Replace single newlines ("\n" or "\r") with spaces
+    text = re.sub(r'\r\n|\r|\n', ' ', text)
     # Replace punctuations causing hallucinations
     pattern = f"[{''.join(map(re.escape, punctuation_switch.keys()))}]"
     text = re.sub(pattern, lambda match: punctuation_switch.get(match.group(), match.group()), text)
     # Replace NBSP with a normal space
     text = text.replace("\xa0", " ")
-    # Replace multiple newlines ("\n\n", "\r\r", "\n\r", etc.) with a ‡pause‡ 2sec
-    text = re.sub(r'(\r\n|\r|\n)+', '‡pause‡', text)
-    # Replace single newlines ("\n" or "\r") with spaces
-    text = re.sub(r'[\r\n]', ' ', text)
     # Replace multiple  and spaces with single space
     text = re.sub(r'[     ]+', ' ', text)
     # Replace ok by 'Owkey'
-    text = re.sub(r'\bok\b', '"O.K."', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bok\b', 'Okay', text, flags=re.IGNORECASE)
     # Replace parentheses with double quotes
     text = re.sub(r'\(([^)]+)\)', r'"\1"', text)
     # Escape special characters in the punctuation list for regex
@@ -676,12 +681,15 @@ def filter_chapter(doc, lang, lang_iso1, tts_engine):
                         text_array.append(line)
             elif tag.name == "p" and tag.find_parent("table"):
                 continue  # Already handled in the <table> section
+            elif tag.name == "p" and "whitespace" in (tag.get("class") or []):
+                if tag.get_text(strip=True) == '\xa0' or not tag.get_text(strip=True):
+                    text_array.append("[pause]")
             elif tag.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
                 raw_text = tag.get_text(strip=True)
                 if raw_text:
                     # replace roman numbers by digits
                     raw_text = replace_roman_numbers(raw_text, lang)
-                    text_array.append(f'— "{raw_text}". ‡pause‡')
+                    text_array.append(f'{raw_text}.[pause]')
             else:
                 raw_text = tag.get_text(strip=True)
                 if raw_text:
@@ -715,19 +723,15 @@ def get_sentences(text, lang, tts_engine):
 
     def segment_ideogramms(text):
         if lang == 'zho':
-            import jieba
             return list(jieba.cut(text))
         elif lang == 'jpn':
-            from sudachipy import dictionary, tokenizer
             sudachi = dictionary.Dictionary().create()
             mode = tokenizer.Tokenizer.SplitMode.C
             return [m.surface() for m in sudachi.tokenize(text, mode)]
         elif lang == 'kor':
-            from konlpy.tag import Kkma
-            kkma = Kkma()
-            return kkma.morphs(text)
+            ltokenizer = LTokenizer()
+            return ltokenizer.tokenize(text)
         elif lang in ['tha', 'lao', 'mya', 'khm']:
-            from pythainlp.tokenize import word_tokenize
             return word_tokenize(text, engine='newmm')
         else:
             pattern_split = [re.escape(p) for p in punctuation_split_set]
@@ -978,6 +982,7 @@ def convert_chapters2audio(session):
                 start = sentence_number
                 msg = f'Block {chapter_num} containing {sentences_count} sentences...'
                 print(msg)
+                print(sentences)
                 for i, sentence in enumerate(sentences):
                     if session['cancellation_requested']:
                         msg = 'Cancel requested'
@@ -2240,6 +2245,8 @@ def web_interface(args):
                 rating = default_xtts_settings['rating']
             elif tts_engine == BARK:
                 rating = default_bark_settings['rating']
+            elif tts_engine == TACOTRON2:
+                rating = default_tacotron_settings['rating']
             elif tts_engine == VITS:
                 rating = default_vits_settings['rating']
             elif tts_engine == FAIRSEQ:

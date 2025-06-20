@@ -1,6 +1,6 @@
 # 📚 ebook2audiobook
 CPU/GPU Converter from eBooks to audiobooks with chapters and metadata<br/>
-using XTTSv2, Bark, Vits, Fairseq, YourTTS and more. Supports voice cloning and +1110 languages!
+using XTTSv2, Bark, Vits, Fairseq, YourTTS, Tacotron and more. Supports voice cloning and +1110 languages!
 > [!IMPORTANT]
 **This tool is intended for use with non-DRM, legally acquired eBooks only.** <br>
 The authors are not responsible for any misuse of this software or any resulting legal consequences. <br>
@@ -53,7 +53,7 @@ https://github.com/user-attachments/assets/d25034d9-c77f-43a9-8f14-0d167172b080
 
 **David Attenborough Voice** 
 
-https://github.com/user-attachments/assets/0d437a41-0b0d-48ed-8c9b-02763d5e48ea  
+https://github.com/user-attachments/assets/81c4baad-117e-4db5-ac86-efc2b7fea921
 
 **Example**
 
@@ -239,7 +239,7 @@ to let the web page reconnect to the new connection socket.**
 usage: app.py [-h] [--session SESSION] [--share] [--headless] [--ebook EBOOK]
               [--ebooks_dir EBOOKS_DIR] [--language LANGUAGE] [--voice VOICE]
               [--device {cpu,gpu,mps}]
-              [--tts_engine {xtts,bark,vits,fairseq,yourtts}]
+              [--tts_engine {xtts,bark,vits,fairseq,tacotron,yourtts}]
               [--custom_model CUSTOM_MODEL] [--fine_tuned FINE_TUNED]
               [--output_format OUTPUT_FORMAT] [--temperature TEMPERATURE]
               [--length_penalty LENGTH_PENALTY] [--num_beams NUM_BEAMS]
@@ -278,8 +278,8 @@ optional parameters:
   --device {cpu,gpu,mps}
                         (Optional) Pprocessor unit type for the conversion. 
                             Default is set in ./lib/conf.py if not present. Fall back to CPU if GPU not available.
-  --tts_engine {xtts,bark,vits,fairseq,yourtts}
-                        (Optional) Preferred TTS engine (available are: ['xtts', 'bark', 'vits', 'fairseq', 'yourtts'].
+  --tts_engine {xtts,bark,vits,fairseq,tacotron,yourtts}
+                        (Optional) Preferred TTS engine (available are: ['xtts', 'bark', 'vits', 'fairseq', 'tacotron', 'yourtts'].
                             Default depends on the selected language. The tts engine should be compatible with the chosen language
   --custom_model CUSTOM_MODEL
                         (Optional) Path to the custom model zip file cntaining mandatory model files. 
@@ -312,10 +312,10 @@ optional parameters:
                             Default to config.json model.
   --text_temp TEXT_TEMP
                         (bark only, optional) Text Temperature for the model. 
-                            Default to 0.88. Higher temperatures lead to more creative outputs.
+                            Default to 0.4. Higher temperatures lead to more creative outputs.
   --waveform_temp WAVEFORM_TEMP
                         (bark only, optional) Waveform Temperature for the model. 
-                            Default to 0.88. Higher temperatures lead to more creative outputs.
+                            Default to 0.4. Higher temperatures lead to more creative outputs.
   --output_dir OUTPUT_DIR
                         (Optional) Path to the output directory. Default is set in ./lib/conf.py
   --version             Show the version of the script and exit
@@ -332,12 +332,13 @@ Linux/Mac:
     Headless mode:
     ./ebook2audiobook.sh --headless --ebook '/path/to/file'
     
-Tip: to add of silence (2 seconds) into your text just use "###" or "[pause]".
+Tip: to add of silence (1.4 seconds) into your text just use "###" or "[pause]".
+
 ```
 
 NOTE: in gradio/gui mode, to cancel a running conversion, just click on the [X] from the ebook upload component.
 
-TIP: if it needs some more pauses, just add '###' or '[pause]' between the words you wish more pause. one [pause] equals to 2 seconds
+TIP: if it needs some more pauses, just add '###' or '[pause]' between the words you wish more pause. one [pause] equals to 1.4 seconds
 
 #### Docker GPU Options
 

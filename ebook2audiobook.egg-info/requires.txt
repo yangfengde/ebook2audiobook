@@ -10,10 +10,10 @@ gradio
 hangul-romanize
 indic-nlp-library
 iso-639
-jieba 
+jieba
 mecab
 mecab-python3
-konlpy
+soynlp
 pythainlp
 m4b-util
 nvidia-ml-py
@@ -24,10 +24,10 @@ ray
 regex
 translate
 tqdm
-suno-bark
 unidic
 pymupdf4llm
+sudachipy
+sudachidict_core
 torch
-coqui-tts
+coqui-tts>=0.26.2
 torchvggish
-transformers<=4.51.3
